@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod decoder;
 pub mod do_put;
 
 use arrow::datatypes::SchemaRef;
