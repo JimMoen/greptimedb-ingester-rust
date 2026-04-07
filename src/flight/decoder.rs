@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 use arrow_flight::decode::{FlightDataDecoder, FlightRecordBatchStream};
 use arrow_flight::error::FlightError;
 use arrow_flight::FlightData;
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, TryStreamExt};
 use tonic::Streaming;
 
 use crate::error::Error;
@@ -30,7 +30,7 @@ pub struct FlightDecoder {
 
 impl FlightDecoder {
     pub fn new(stream: Streaming<FlightData>) -> Self {
-        let stream = stream.map(|res| res.map_err(FlightError::Tonic));
+        let stream = stream.map_err(FlightError::Tonic);
         let flight_data_decoder = FlightDataDecoder::new(stream);
         Self {
             stream: FlightRecordBatchStream::new(flight_data_decoder),
