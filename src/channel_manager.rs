@@ -107,20 +107,33 @@ impl ChannelManager {
             msg: "no config input",
         })?;
 
-        let server_root_ca_cert = std::fs::read_to_string(path_config.server_ca_cert_path)
-            .context(InvalidConfigFilePathSnafu)?;
-        let server_root_ca_cert = Certificate::from_pem(server_root_ca_cert);
-        let client_cert = std::fs::read_to_string(path_config.client_cert_path)
-            .context(InvalidConfigFilePathSnafu)?;
-        let client_key = std::fs::read_to_string(path_config.client_key_path)
-            .context(InvalidConfigFilePathSnafu)?;
-        let client_identity = Identity::from_pem(client_cert, client_key);
+        let mut tls_config = ClientTlsConfig::new().with_enabled_roots();
 
-        inner.client_tls_config = Some(
-            ClientTlsConfig::new()
-                .ca_certificate(server_root_ca_cert)
-                .identity(client_identity),
-        );
+        if !path_config.server_ca_cert_path.is_empty() {
+            let server_root_ca_cert = std::fs::read_to_string(path_config.server_ca_cert_path)
+                .context(InvalidConfigFilePathSnafu)?;
+            let server_root_ca_cert = Certificate::from_pem(server_root_ca_cert);
+            tls_config = tls_config.ca_certificate(server_root_ca_cert);
+        }
+
+        let has_client_cert = !path_config.client_cert_path.is_empty();
+        let has_client_key = !path_config.client_key_path.is_empty();
+        if has_client_cert != has_client_key {
+            return InvalidTlsConfigSnafu {
+                msg: "client cert and key must be configured together".to_string(),
+            }
+            .fail();
+        }
+        if has_client_cert {
+            let client_cert = std::fs::read_to_string(path_config.client_cert_path)
+                .context(InvalidConfigFilePathSnafu)?;
+            let client_key = std::fs::read_to_string(path_config.client_key_path)
+                .context(InvalidConfigFilePathSnafu)?;
+            let client_identity = Identity::from_pem(client_cert, client_key);
+            tls_config = tls_config.identity(client_identity);
+        }
+
+        inner.client_tls_config = Some(tls_config);
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -712,5 +725,29 @@ mod tests {
         drop(mgr);
 
         assert_eq!(1, Arc::strong_count(&pool_holder));
+    }
+
+    #[test]
+    fn test_with_tls_config_allows_empty_cert_paths() {
+        let config = ChannelConfig::new().client_tls_config(ClientTlsOption {
+            server_ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
+        });
+
+        let manager = ChannelManager::with_tls_config(config);
+        assert!(manager.is_ok());
+    }
+
+    #[test]
+    fn test_with_tls_config_rejects_partial_client_cert_config() {
+        let config = ChannelConfig::new().client_tls_config(ClientTlsOption {
+            server_ca_cert_path: String::new(),
+            client_cert_path: "/tmp/client.crt".to_string(),
+            client_key_path: String::new(),
+        });
+
+        let manager = ChannelManager::with_tls_config(config);
+        assert!(manager.is_err());
     }
 }
