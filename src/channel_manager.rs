@@ -241,7 +241,7 @@ impl ChannelManager {
         let tls_config = build_insecure_client_tls_config(path_config)?;
         Ok(HttpsConnectorBuilder::new()
             .with_tls_config(tls_config)
-            .https_or_http()
+            .https_only()
             .enable_http2()
             .build())
     }
