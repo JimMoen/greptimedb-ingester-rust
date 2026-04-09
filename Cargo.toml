@@ -22,6 +22,7 @@ futures-util  = "0.3"
 greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "454c52634c3bac27de10bf0d85d5533eed1cf03f" }
 hyper = "1.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http2", "native-tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http2"] }
 lazy_static = "1.4"
 parking_lot = "0.12"
 prost = { version = "0.13", features = ["no-recursion-limit"] }
@@ -43,7 +44,6 @@ toml = "0.9.8"
 tonic-build = "0.11"
 
 [dev-dependencies]
-hyper-util = "0.1"
 tokio = { version = "1.40", features = ["full"] }
 derive-new = "0.7"
 uuid = { version = "1.0", features = ["v4"] }
