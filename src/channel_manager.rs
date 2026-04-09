@@ -261,6 +261,20 @@ impl ChannelManager {
 
         let mut endpoint =
             Endpoint::new(format!("{http_prefix}://{addr}")).context(CreateChannelSnafu)?;
+        if force_http_scheme {
+            let mut origin_parts = endpoint.uri().clone().into_parts();
+            origin_parts.scheme = Some("https".parse().expect("valid https scheme"));
+            let origin = match Uri::from_parts(origin_parts) {
+                Ok(uri) => uri,
+                Err(err) => {
+                    return InvalidTlsConfigSnafu {
+                        msg: format!("invalid tls origin uri, {err}"),
+                    }
+                    .fail()
+                }
+            };
+            endpoint = endpoint.origin(origin);
+        }
 
         if let Some(dur) = self.config().timeout {
             endpoint = endpoint.timeout(dur);
