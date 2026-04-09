@@ -173,7 +173,7 @@ impl ChannelManager {
             }
             Entry::Vacant(entry) => {
                 let use_insecure_tls = self.use_insecure_tls();
-                let endpoint = self.build_endpoint(addr, !use_insecure_tls)?;
+                let endpoint = self.build_endpoint(addr, !use_insecure_tls, use_insecure_tls)?;
                 let inner_channel = if use_insecure_tls {
                     let connector = self.build_insecure_https_connector()?;
                     endpoint.connect_with_connector_lazy(connector)
@@ -204,7 +204,7 @@ impl ChannelManager {
         Box<dyn std::error::Error + Send + Sync>: From<C::Error> + Send + 'static,
     {
         let addr = addr.as_ref();
-        let endpoint = self.build_endpoint(addr, true)?;
+        let endpoint = self.build_endpoint(addr, true, false)?;
         let inner_channel = endpoint.connect_with_connector_lazy(connector);
         let channel = Channel {
             channel: inner_channel.clone(),
@@ -227,9 +227,7 @@ impl ChannelManager {
         self.inner.client_tls_config.is_some() && self.config().tls_verify == TlsVerify::VerifyNone
     }
 
-    fn build_insecure_https_connector(
-        &self,
-    ) -> Result<hyper_rustls::HttpsConnector<HttpConnector>> {
+    fn build_insecure_https_connector(&self) -> Result<HttpsOverHttpConnector> {
         ensure_default_crypto_provider();
         let path_config = self
             .config()
@@ -239,15 +237,23 @@ impl ChannelManager {
                 msg: "no config input",
             })?;
         let tls_config = build_insecure_client_tls_config(path_config)?;
-        Ok(HttpsConnectorBuilder::new()
+        let inner = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config)
             .https_only()
             .enable_http2()
-            .build())
+            .build();
+        Ok(HttpsOverHttpConnector { inner })
     }
 
-    fn build_endpoint(&self, addr: &str, apply_tonic_tls_config: bool) -> Result<Endpoint> {
-        let http_prefix = if self.inner.client_tls_config.is_some() {
+    fn build_endpoint(
+        &self,
+        addr: &str,
+        apply_tonic_tls_config: bool,
+        force_http_scheme: bool,
+    ) -> Result<Endpoint> {
+        let http_prefix = if force_http_scheme {
+            "http"
+        } else if self.inner.client_tls_config.is_some() {
             "https"
         } else {
             "http"
@@ -316,6 +322,31 @@ impl ChannelManager {
         let _handle = tokio::spawn(async move {
             recycle_channel_in_loop(pool, cancel, RECYCLE_CHANNEL_INTERVAL_SECS).await;
         });
+    }
+}
+
+#[derive(Clone)]
+struct HttpsOverHttpConnector {
+    inner: hyper_rustls::HttpsConnector<HttpConnector>,
+}
+
+impl Service<Uri> for HttpsOverHttpConnector {
+    type Response = <hyper_rustls::HttpsConnector<HttpConnector> as Service<Uri>>::Response;
+    type Error = <hyper_rustls::HttpsConnector<HttpConnector> as Service<Uri>>::Error;
+    type Future = <hyper_rustls::HttpsConnector<HttpConnector> as Service<Uri>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let mut parts = uri.into_parts();
+        parts.scheme = Some("https".parse().expect("valid https scheme"));
+        let https_uri = Uri::from_parts(parts).expect("valid uri parts");
+        self.inner.call(https_uri)
     }
 }
 
@@ -847,7 +878,7 @@ mod tests {
             .tcp_nodelay(true);
         let mgr = ChannelManager::with_config(config);
 
-        let res = mgr.build_endpoint("test_addr", true);
+        let res = mgr.build_endpoint("test_addr", true, false);
 
         let _ = res.unwrap();
     }
