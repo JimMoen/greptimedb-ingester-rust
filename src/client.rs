@@ -22,7 +22,7 @@ use snafu::OptionExt;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
 
-use crate::channel_manager::{ChannelConfig, ChannelManager, ClientTlsOption};
+use crate::channel_manager::{ChannelConfig, ChannelManager, ClientTlsOption, TlsVerify};
 use crate::load_balance::{LoadBalance, Loadbalancer};
 use crate::{error, Result};
 
@@ -65,6 +65,22 @@ impl Client {
         A: AsRef<[U]>,
     {
         let channel_config = ChannelConfig::default().client_tls_config(client_tls);
+        let channel_manager = ChannelManager::with_tls_config(channel_config)?;
+        Ok(Self::with_manager_and_urls(channel_manager, urls))
+    }
+
+    pub fn with_tls_and_urls_with_verify<U, A>(
+        urls: A,
+        client_tls: ClientTlsOption,
+        tls_verify: TlsVerify,
+    ) -> Result<Self>
+    where
+        U: AsRef<str>,
+        A: AsRef<[U]>,
+    {
+        let channel_config = ChannelConfig::default()
+            .tls_verify(tls_verify)
+            .client_tls_config(client_tls);
         let channel_manager = ChannelManager::with_tls_config(channel_config)?;
         Ok(Self::with_manager_and_urls(channel_manager, urls))
     }
