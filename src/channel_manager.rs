@@ -172,8 +172,8 @@ impl ChannelManager {
                 entry.into_ref()
             }
             Entry::Vacant(entry) => {
-                let endpoint = self.build_endpoint(addr)?;
                 let use_insecure_tls = self.use_insecure_tls();
+                let endpoint = self.build_endpoint(addr, !use_insecure_tls)?;
                 let inner_channel = if use_insecure_tls {
                     let connector = self.build_insecure_https_connector()?;
                     endpoint.connect_with_connector_lazy(connector)
@@ -204,7 +204,7 @@ impl ChannelManager {
         Box<dyn std::error::Error + Send + Sync>: From<C::Error> + Send + 'static,
     {
         let addr = addr.as_ref();
-        let endpoint = self.build_endpoint(addr)?;
+        let endpoint = self.build_endpoint(addr, true)?;
         let inner_channel = endpoint.connect_with_connector_lazy(connector);
         let channel = Channel {
             channel: inner_channel.clone(),
@@ -246,7 +246,7 @@ impl ChannelManager {
             .build())
     }
 
-    fn build_endpoint(&self, addr: &str) -> Result<Endpoint> {
+    fn build_endpoint(&self, addr: &str, apply_tonic_tls_config: bool) -> Result<Endpoint> {
         let http_prefix = if self.inner.client_tls_config.is_some() {
             "https"
         } else {
@@ -286,10 +286,12 @@ impl ChannelManager {
         if let Some(enabled) = self.config().http2_adaptive_window {
             endpoint = endpoint.http2_adaptive_window(enabled);
         }
-        if let Some(tls_config) = &self.inner.client_tls_config {
-            endpoint = endpoint
-                .tls_config(tls_config.clone())
-                .context(CreateChannelSnafu)?;
+        if apply_tonic_tls_config {
+            if let Some(tls_config) = &self.inner.client_tls_config {
+                endpoint = endpoint
+                    .tls_config(tls_config.clone())
+                    .context(CreateChannelSnafu)?;
+            }
         }
 
         endpoint = endpoint
@@ -845,7 +847,7 @@ mod tests {
             .tcp_nodelay(true);
         let mgr = ChannelManager::with_config(config);
 
-        let res = mgr.build_endpoint("test_addr");
+        let res = mgr.build_endpoint("test_addr", true);
 
         let _ = res.unwrap();
     }
