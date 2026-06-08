@@ -173,9 +173,15 @@ impl ChannelManager {
             }
             Entry::Vacant(entry) => {
                 let use_insecure_tls = self.use_insecure_tls();
-                let endpoint = self.build_endpoint(addr, !use_insecure_tls, use_insecure_tls)?;
-                let inner_channel = if use_insecure_tls {
-                    let connector = self.build_insecure_https_connector()?;
+                let has_custom_cipher = self.has_custom_cipher_requirement();
+                let use_custom_tls = use_insecure_tls || has_custom_cipher;
+                let endpoint = self.build_endpoint(addr, !use_custom_tls, use_custom_tls)?;
+                let inner_channel = if use_custom_tls {
+                    let connector = if use_insecure_tls {
+                        self.build_insecure_https_connector()?
+                    } else {
+                        self.build_verified_https_connector_with_ciphers()?
+                    };
                     endpoint.connect_with_connector_lazy(connector)
                 } else {
                     endpoint.connect_lazy()
@@ -184,7 +190,7 @@ impl ChannelManager {
                 let channel = Channel {
                     channel: inner_channel,
                     access: AtomicUsize::new(1),
-                    use_default_connector: !use_insecure_tls,
+                    use_default_connector: !use_custom_tls,
                 };
                 entry.insert(channel)
             }
@@ -227,6 +233,14 @@ impl ChannelManager {
         self.inner.client_tls_config.is_some() && self.config().tls_verify == TlsVerify::VerifyNone
     }
 
+    fn has_custom_cipher_requirement(&self) -> bool {
+        if let Some(ref tls) = self.config().client_tls {
+            !tls.cipher_suites.is_empty()
+        } else {
+            false
+        }
+    }
+
     fn build_insecure_https_connector(&self) -> Result<HttpsOverHttpConnector> {
         ensure_default_crypto_provider();
         let path_config = self
@@ -236,7 +250,28 @@ impl ChannelManager {
             .context(InvalidTlsConfigSnafu {
                 msg: "no config input",
             })?;
-        let tls_config = build_insecure_client_tls_config(path_config)?;
+        let tls_config = build_custom_client_tls_config(path_config, TlsVerify::VerifyNone)?;
+        let inner = HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_only()
+            .enable_http2()
+            .build();
+        Ok(HttpsOverHttpConnector { inner })
+    }
+
+    fn build_verified_https_connector_with_ciphers(
+        &self,
+    ) -> Result<HttpsOverHttpConnector> {
+        ensure_default_crypto_provider();
+        let path_config = self
+            .config()
+            .client_tls
+            .as_ref()
+            .context(InvalidTlsConfigSnafu {
+                msg: "no config input",
+            })?;
+        let tls_config =
+            build_custom_client_tls_config(path_config, TlsVerify::VerifyPeer)?;
         let inner = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config)
             .https_only()
@@ -364,12 +399,25 @@ impl Service<Uri> for HttpsOverHttpConnector {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ClientTlsOption {
     pub server_ca_cert_path: String,
     pub client_cert_path: String,
     pub client_key_path: String,
+    /// If non-empty, only allow these cipher suites.
+    /// Names are OpenSSL-style, e.g. "TLS_AES_256_GCM_SHA384".
+    pub cipher_suites: Vec<String>,
 }
+
+impl PartialEq for ClientTlsOption {
+    fn eq(&self, other: &Self) -> bool {
+        self.server_ca_cert_path == other.server_ca_cert_path
+            && self.client_cert_path == other.client_cert_path
+            && self.client_key_path == other.client_key_path
+            && self.cipher_suites == other.cipher_suites
+    }
+}
+impl Eq for ClientTlsOption {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TlsVerify {
@@ -611,7 +659,84 @@ fn ensure_default_crypto_provider() {
     }
 }
 
-fn build_insecure_client_tls_config(path_config: &ClientTlsOption) -> Result<rustls::ClientConfig> {
+fn parse_cipher_suite_name(name: &str) -> Option<rustls::CipherSuite> {
+    match name {
+        "TLS_AES_256_GCM_SHA384" => Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+        "TLS_AES_128_GCM_SHA256" => Some(rustls::CipherSuite::TLS13_AES_128_GCM_SHA256),
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
+            Some(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
+        }
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
+            Some(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+        }
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
+            Some(rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384)
+        }
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
+            Some(rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
+        }
+        _ => None,
+    }
+}
+
+fn make_custom_crypto_provider_with_ciphers(
+    allowed_cipher_names: &[String],
+) -> Result<Arc<rustls::crypto::CryptoProvider>> {
+    let default = rustls::crypto::aws_lc_rs::default_provider();
+    let allowed_suites: Vec<rustls::CipherSuite> = allowed_cipher_names
+        .iter()
+        .filter_map(|name| parse_cipher_suite_name(name))
+        .collect();
+
+    if allowed_suites.is_empty() {
+        return InvalidTlsConfigSnafu {
+            msg: format!(
+                "no valid cipher suite found in {:?}",
+                allowed_cipher_names
+            ),
+        }
+        .fail();
+    }
+
+    let filtered: Vec<_> = default
+        .cipher_suites
+        .iter()
+        .filter(|cs| allowed_suites.contains(&cs.suite()))
+        .copied()
+        .collect();
+
+    if filtered.is_empty() {
+        return InvalidTlsConfigSnafu {
+            msg: format!(
+                "none of the requested cipher suites are available: {:?}",
+                allowed_cipher_names
+            ),
+        }
+        .fail();
+    }
+
+    let custom = rustls::crypto::CryptoProvider {
+        cipher_suites: filtered,
+        kx_groups: default.kx_groups.clone(),
+        signature_verification_algorithms: default.signature_verification_algorithms,
+        secure_random: default.secure_random,
+        key_provider: default.key_provider,
+    };
+
+    Ok(Arc::new(custom))
+}
+
+fn build_custom_client_tls_config(
+    path_config: &ClientTlsOption,
+    tls_verify: TlsVerify,
+) -> Result<rustls::ClientConfig> {
+    let provider: Arc<rustls::crypto::CryptoProvider> =
+        if !path_config.cipher_suites.is_empty() {
+            make_custom_crypto_provider_with_ciphers(&path_config.cipher_suites)?
+        } else {
+        rustls::crypto::aws_lc_rs::default_provider().into()
+        };
+
     let has_client_cert = !path_config.client_cert_path.is_empty();
     let has_client_key = !path_config.client_key_path.is_empty();
     if has_client_cert != has_client_key {
@@ -621,56 +746,90 @@ fn build_insecure_client_tls_config(path_config: &ClientTlsOption) -> Result<rus
         .fail();
     }
 
-    let tls_config = if has_client_cert {
-        let cert_chain = load_client_cert_chain(path_config.client_cert_path.as_str())?;
-        let private_key = load_client_private_key(path_config.client_key_path.as_str())?;
-        let builder = match rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        )
+    let builder = match rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        {
-            Ok(builder) => builder,
-            Err(err) => {
-                return InvalidTlsConfigSnafu {
-                    msg: format!("invalid TLS protocol versions, {err}"),
-                }
-                .fail()
+    {
+        Ok(builder) => builder,
+        Err(err) => {
+            return InvalidTlsConfigSnafu {
+                msg: format!("invalid TLS protocol versions, {err}"),
             }
-        };
-        match builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_client_auth_cert(cert_chain, private_key)
-        {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                return InvalidTlsConfigSnafu {
-                    msg: format!("invalid client certificate or key, {err}"),
-                }
-                .fail()
-            }
+            .fail()
         }
-    } else {
-        let builder = match rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        )
-        .with_safe_default_protocol_versions()
-        {
-            Ok(builder) => builder,
-            Err(err) => {
-                return InvalidTlsConfigSnafu {
-                    msg: format!("invalid TLS protocol versions, {err}"),
-                }
-                .fail()
-            }
-        };
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
     };
 
-    Ok(tls_config)
+    match tls_verify {
+        TlsVerify::VerifyNone => {
+            if has_client_cert {
+                let cert_chain =
+                    load_client_cert_chain(path_config.client_cert_path.as_str())?;
+                let private_key =
+                    load_client_private_key(path_config.client_key_path.as_str())?;
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .map_err(|err| {
+                        InvalidTlsConfigSnafu {
+                            msg: format!("invalid client certificate or key, {err}"),
+                        }
+                        .build()
+                    })
+            } else {
+                Ok(builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                    .with_no_client_auth())
+            }
+        }
+        TlsVerify::VerifyPeer => {
+            let mut root_store = rustls::RootCertStore::empty();
+            if !path_config.server_ca_cert_path.is_empty() {
+                let ca_cert_pem =
+                    std::fs::read_to_string(&path_config.server_ca_cert_path)
+                        .context(InvalidConfigFilePathSnafu)?;
+                let mut reader = BufReader::new(ca_cert_pem.as_bytes());
+                let certs = rustls_pemfile::certs(&mut reader)
+                    .collect::<std::result::Result<Vec<_>, std::io::Error>>()
+                    .map_err(|err| {
+                        InvalidTlsConfigSnafu {
+                            msg: format!(
+                                "invalid CA cert file `{}`, {err}",
+                                path_config.server_ca_cert_path
+                            ),
+                        }
+                        .build()
+                    })?;
+                for cert in certs {
+                    root_store.add(cert).map_err(|err| {
+                        InvalidTlsConfigSnafu {
+                            msg: format!(
+                                "failed to add CA cert to root store, {err}"
+                            ),
+                        }
+                        .build()
+                    })?;
+                }
+            }
+            let config_builder = builder.with_root_certificates(root_store);
+            if has_client_cert {
+                let cert_chain =
+                    load_client_cert_chain(path_config.client_cert_path.as_str())?;
+                let private_key =
+                    load_client_private_key(path_config.client_key_path.as_str())?;
+                config_builder
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .map_err(|err| {
+                        InvalidTlsConfigSnafu {
+                            msg: format!("invalid client certificate or key, {err}"),
+                        }
+                        .build()
+                    })
+            } else {
+                Ok(config_builder.with_no_client_auth())
+            }
+        }
+    }
 }
 
 fn load_client_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
