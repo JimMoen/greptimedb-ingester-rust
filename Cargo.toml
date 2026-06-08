@@ -21,13 +21,14 @@ futures = "0.3"
 futures-util  = "0.3"
 greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "454c52634c3bac27de10bf0d85d5533eed1cf03f" }
 hyper = "1.1"
-hyper-rustls = { version = "0.27", default-features = false, features = ["http2", "native-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http2", "native-tokio", "tls12", "aws-lc-rs"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http2"] }
 lazy_static = "1.4"
 parking_lot = "0.12"
 prost = { version = "0.13", features = ["no-recursion-limit"] }
 rand = "0.9"
 rustls = "0.23"
+rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
