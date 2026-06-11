@@ -399,25 +399,15 @@ impl Service<Uri> for HttpsOverHttpConnector {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientTlsOption {
     pub server_ca_cert_path: String,
     pub client_cert_path: String,
     pub client_key_path: String,
     /// If non-empty, only allow these cipher suites.
-    /// Names are OpenSSL-style, e.g. "TLS_AES_256_GCM_SHA384".
+    /// Names use IANA naming convention, e.g. "TLS_AES_256_GCM_SHA384".
     pub cipher_suites: Vec<String>,
 }
-
-impl PartialEq for ClientTlsOption {
-    fn eq(&self, other: &Self) -> bool {
-        self.server_ca_cert_path == other.server_ca_cert_path
-            && self.client_cert_path == other.client_cert_path
-            && self.client_key_path == other.client_key_path
-            && self.cipher_suites == other.cipher_suites
-    }
-}
-impl Eq for ClientTlsOption {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TlsVerify {
@@ -663,6 +653,9 @@ fn parse_cipher_suite_name(name: &str) -> Option<rustls::CipherSuite> {
     match name {
         "TLS_AES_256_GCM_SHA384" => Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
         "TLS_AES_128_GCM_SHA256" => Some(rustls::CipherSuite::TLS13_AES_128_GCM_SHA256),
+        "TLS_CHACHA20_POLY1305_SHA256" => {
+            Some(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+        }
         "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
             Some(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
         }
@@ -734,7 +727,7 @@ fn build_custom_client_tls_config(
         if !path_config.cipher_suites.is_empty() {
             make_custom_crypto_provider_with_ciphers(&path_config.cipher_suites)?
         } else {
-        rustls::crypto::aws_lc_rs::default_provider().into()
+            rustls::crypto::aws_lc_rs::default_provider().into()
         };
 
     let has_client_cert = !path_config.client_cert_path.is_empty();
@@ -809,6 +802,18 @@ fn build_custom_client_tls_config(
                         }
                         .build()
                     })?;
+                }
+            } else {
+                // No explicit CA cert path: load system native root certificates
+                let native_certs = rustls_native_certs::load_native_certs();
+                for cert in native_certs.certs {
+                    let _ = root_store.add(cert);
+                }
+                if root_store.is_empty() {
+                    return InvalidTlsConfigSnafu {
+                        msg: "no CA certificates found: ca_cert not configured and no system root certificates available".to_string(),
+                    }
+                    .fail();
                 }
             }
             let config_builder = builder.with_root_certificates(root_store);
