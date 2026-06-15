@@ -15,6 +15,8 @@
 // Integration tests for GreptimeDB Rust Ingester
 // These tests require a running GreptimeDB instance
 
+use arrow_array::Array;
+use futures_util::StreamExt;
 use greptimedb_ingester::api::v1::*;
 use greptimedb_ingester::client::Client;
 use greptimedb_ingester::helpers::schema::*;
@@ -417,4 +419,79 @@ fn create_test_batch_bulk(
     }
 
     Ok(rows)
+}
+
+#[tokio::test]
+async fn test_query_databases() -> Result<()> {
+    let config = TestConfig::new();
+    let client = Client::with_urls([&config.endpoint]);
+    let database = Database::new_with_dbname(&config.database, client);
+
+    let mut stream = database.query("SHOW DATABASES").await?;
+
+    let mut found = false;
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let db_names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        for db in db_names {
+            if db.unwrap_or_default() == config.database {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found);
+
+    println!("✓ Query databases test passed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_query_table_schema() -> Result<()> {
+    let config = TestConfig::new();
+    let client = Client::with_urls([&config.endpoint]);
+    let database = Database::new_with_dbname(&config.database, client);
+
+    let table_name = unique_table_name("test_query_table_schema");
+    let create_table_sql = format!(
+        "CREATE TABLE {} (ts TIMESTAMP TIME INDEX, valcol DOUBLE)",
+        table_name
+    );
+    let mut stream = database.query(&create_table_sql).await?;
+    while (stream.next().await).is_some() {}
+
+    let mut stream = database.query(&format!("DESCRIBE {}", table_name)).await?;
+    let mut columns = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let column_names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let data_types = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        for i in 0..column_names.len() {
+            columns.push((
+                column_names.value(i).to_string(),
+                data_types.value(i).to_string(),
+            ));
+        }
+    }
+
+    assert_eq!(columns.len(), 2);
+    assert_eq!(columns[0].0, "ts");
+    assert_eq!(columns[0].1, "TimestampMillisecond");
+    assert_eq!(columns[1].0, "valcol");
+    assert_eq!(columns[1].1, "Float64");
+
+    println!("✓ Query table schema test passed");
+    Ok(())
 }

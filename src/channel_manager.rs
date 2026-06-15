@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::connect::HttpConnector;
 use lazy_static::lazy_static;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use snafu::{OptionExt, ResultExt};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{
@@ -100,6 +106,7 @@ impl ChannelManager {
     }
 
     pub fn with_tls_config(config: ChannelConfig) -> Result<Self> {
+        ensure_default_crypto_provider();
         let mut inner = Inner::with_config(config.clone());
 
         // setup tls
@@ -107,20 +114,34 @@ impl ChannelManager {
             msg: "no config input",
         })?;
 
-        let server_root_ca_cert = std::fs::read_to_string(path_config.server_ca_cert_path)
-            .context(InvalidConfigFilePathSnafu)?;
-        let server_root_ca_cert = Certificate::from_pem(server_root_ca_cert);
-        let client_cert = std::fs::read_to_string(path_config.client_cert_path)
-            .context(InvalidConfigFilePathSnafu)?;
-        let client_key = std::fs::read_to_string(path_config.client_key_path)
-            .context(InvalidConfigFilePathSnafu)?;
-        let client_identity = Identity::from_pem(client_cert, client_key);
+        let mut tls_config = ClientTlsConfig::new().with_enabled_roots();
 
-        inner.client_tls_config = Some(
-            ClientTlsConfig::new()
-                .ca_certificate(server_root_ca_cert)
-                .identity(client_identity),
-        );
+        if config.tls_verify == TlsVerify::VerifyPeer && !path_config.server_ca_cert_path.is_empty()
+        {
+            let server_root_ca_cert = std::fs::read_to_string(path_config.server_ca_cert_path)
+                .context(InvalidConfigFilePathSnafu)?;
+            let server_root_ca_cert = Certificate::from_pem(server_root_ca_cert);
+            tls_config = tls_config.ca_certificate(server_root_ca_cert);
+        }
+
+        let has_client_cert = !path_config.client_cert_path.is_empty();
+        let has_client_key = !path_config.client_key_path.is_empty();
+        if has_client_cert != has_client_key {
+            return InvalidTlsConfigSnafu {
+                msg: "client cert and key must be configured together".to_string(),
+            }
+            .fail();
+        }
+        if has_client_cert {
+            let client_cert = std::fs::read_to_string(path_config.client_cert_path)
+                .context(InvalidConfigFilePathSnafu)?;
+            let client_key = std::fs::read_to_string(path_config.client_key_path)
+                .context(InvalidConfigFilePathSnafu)?;
+            let client_identity = Identity::from_pem(client_cert, client_key);
+            tls_config = tls_config.identity(client_identity);
+        }
+
+        inner.client_tls_config = Some(tls_config);
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -151,13 +172,25 @@ impl ChannelManager {
                 entry.into_ref()
             }
             Entry::Vacant(entry) => {
-                let endpoint = self.build_endpoint(addr)?;
-                let inner_channel = endpoint.connect_lazy();
+                let use_insecure_tls = self.use_insecure_tls();
+                let has_custom_cipher = self.has_custom_cipher_requirement();
+                let use_custom_tls = use_insecure_tls || has_custom_cipher;
+                let endpoint = self.build_endpoint(addr, !use_custom_tls, use_custom_tls)?;
+                let inner_channel = if use_custom_tls {
+                    let connector = if use_insecure_tls {
+                        self.build_insecure_https_connector()?
+                    } else {
+                        self.build_verified_https_connector_with_ciphers()?
+                    };
+                    endpoint.connect_with_connector_lazy(connector)
+                } else {
+                    endpoint.connect_lazy()
+                };
 
                 let channel = Channel {
                     channel: inner_channel,
                     access: AtomicUsize::new(1),
-                    use_default_connector: true,
+                    use_default_connector: !use_custom_tls,
                 };
                 entry.insert(channel)
             }
@@ -177,7 +210,7 @@ impl ChannelManager {
         Box<dyn std::error::Error + Send + Sync>: From<C::Error> + Send + 'static,
     {
         let addr = addr.as_ref();
-        let endpoint = self.build_endpoint(addr)?;
+        let endpoint = self.build_endpoint(addr, true, false)?;
         let inner_channel = endpoint.connect_with_connector_lazy(connector);
         let channel = Channel {
             channel: inner_channel.clone(),
@@ -196,8 +229,63 @@ impl ChannelManager {
         self.pool().retain_channel(f);
     }
 
-    fn build_endpoint(&self, addr: &str) -> Result<Endpoint> {
-        let http_prefix = if self.inner.client_tls_config.is_some() {
+    fn use_insecure_tls(&self) -> bool {
+        self.inner.client_tls_config.is_some() && self.config().tls_verify == TlsVerify::VerifyNone
+    }
+
+    fn has_custom_cipher_requirement(&self) -> bool {
+        if let Some(ref tls) = self.config().client_tls {
+            !tls.cipher_suites.is_empty()
+        } else {
+            false
+        }
+    }
+
+    fn build_insecure_https_connector(&self) -> Result<HttpsOverHttpConnector> {
+        ensure_default_crypto_provider();
+        let path_config = self
+            .config()
+            .client_tls
+            .as_ref()
+            .context(InvalidTlsConfigSnafu {
+                msg: "no config input",
+            })?;
+        let tls_config = build_custom_client_tls_config(path_config, TlsVerify::VerifyNone)?;
+        let inner = HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_only()
+            .enable_http2()
+            .build();
+        Ok(HttpsOverHttpConnector { inner })
+    }
+
+    fn build_verified_https_connector_with_ciphers(&self) -> Result<HttpsOverHttpConnector> {
+        ensure_default_crypto_provider();
+        let path_config = self
+            .config()
+            .client_tls
+            .as_ref()
+            .context(InvalidTlsConfigSnafu {
+                msg: "no config input",
+            })?;
+        let tls_config = build_custom_client_tls_config(path_config, TlsVerify::VerifyPeer)?;
+        let inner = HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_only()
+            .enable_http2()
+            .build();
+        Ok(HttpsOverHttpConnector { inner })
+    }
+
+    fn build_endpoint(
+        &self,
+        addr: &str,
+        apply_tonic_tls_config: bool,
+        force_http_scheme: bool,
+    ) -> Result<Endpoint> {
+        let http_prefix = if force_http_scheme {
+            "http"
+        } else if self.inner.client_tls_config.is_some() {
             "https"
         } else {
             "http"
@@ -205,6 +293,20 @@ impl ChannelManager {
 
         let mut endpoint =
             Endpoint::new(format!("{http_prefix}://{addr}")).context(CreateChannelSnafu)?;
+        if force_http_scheme {
+            let mut origin_parts = endpoint.uri().clone().into_parts();
+            origin_parts.scheme = Some("https".parse().expect("valid https scheme"));
+            let origin = match Uri::from_parts(origin_parts) {
+                Ok(uri) => uri,
+                Err(err) => {
+                    return InvalidTlsConfigSnafu {
+                        msg: format!("invalid tls origin uri, {err}"),
+                    }
+                    .fail()
+                }
+            };
+            endpoint = endpoint.origin(origin);
+        }
 
         if let Some(dur) = self.config().timeout {
             endpoint = endpoint.timeout(dur);
@@ -236,10 +338,12 @@ impl ChannelManager {
         if let Some(enabled) = self.config().http2_adaptive_window {
             endpoint = endpoint.http2_adaptive_window(enabled);
         }
-        if let Some(tls_config) = &self.inner.client_tls_config {
-            endpoint = endpoint
-                .tls_config(tls_config.clone())
-                .context(CreateChannelSnafu)?;
+        if apply_tonic_tls_config {
+            if let Some(tls_config) = &self.inner.client_tls_config {
+                endpoint = endpoint
+                    .tls_config(tls_config.clone())
+                    .context(CreateChannelSnafu)?;
+            }
         }
 
         endpoint = endpoint
@@ -267,11 +371,46 @@ impl ChannelManager {
     }
 }
 
+#[derive(Clone)]
+struct HttpsOverHttpConnector {
+    inner: hyper_rustls::HttpsConnector<HttpConnector>,
+}
+
+impl Service<Uri> for HttpsOverHttpConnector {
+    type Response = <hyper_rustls::HttpsConnector<HttpConnector> as Service<Uri>>::Response;
+    type Error = <hyper_rustls::HttpsConnector<HttpConnector> as Service<Uri>>::Error;
+    type Future = <hyper_rustls::HttpsConnector<HttpConnector> as Service<Uri>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let mut parts = uri.into_parts();
+        parts.scheme = Some("https".parse().expect("valid https scheme"));
+        let https_uri = Uri::from_parts(parts).expect("valid uri parts");
+        self.inner.call(https_uri)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientTlsOption {
     pub server_ca_cert_path: String,
     pub client_cert_path: String,
     pub client_key_path: String,
+    /// If non-empty, only allow these cipher suites.
+    /// Names use IANA naming convention, e.g. "TLS_AES_256_GCM_SHA384".
+    pub cipher_suites: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TlsVerify {
+    #[default]
+    VerifyPeer,
+    VerifyNone,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,6 +427,7 @@ pub struct ChannelConfig {
     pub http2_adaptive_window: Option<bool>,
     pub tcp_keepalive: Option<Duration>,
     pub tcp_nodelay: bool,
+    pub tls_verify: TlsVerify,
     pub client_tls: Option<ClientTlsOption>,
     // Max gRPC receiving(decoding) message size
     pub max_recv_message_size: u64,
@@ -312,6 +452,7 @@ impl Default for ChannelConfig {
             http2_adaptive_window: None,
             tcp_keepalive: None,
             tcp_nodelay: true,
+            tls_verify: TlsVerify::VerifyPeer,
             client_tls: None,
             max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
             max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
@@ -410,6 +551,11 @@ impl ChannelConfig {
         self
     }
 
+    pub fn tls_verify(mut self, verify: TlsVerify) -> Self {
+        self.tls_verify = verify;
+        self
+    }
+
     /// Set the value of tls client auth.
     ///
     /// Disabled by default.
@@ -494,6 +640,266 @@ async fn recycle_channel_in_loop(pool: Arc<Pool>, cancel: CancellationToken, int
     }
 }
 
+fn ensure_default_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
+fn parse_cipher_suite_name(name: &str) -> Option<rustls::CipherSuite> {
+    match name {
+        "TLS_AES_256_GCM_SHA384" => Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+        "TLS_AES_128_GCM_SHA256" => Some(rustls::CipherSuite::TLS13_AES_128_GCM_SHA256),
+        "TLS_CHACHA20_POLY1305_SHA256" => Some(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256),
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
+            Some(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
+        }
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
+            Some(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+        }
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
+            Some(rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384)
+        }
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
+            Some(rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
+        }
+        _ => None,
+    }
+}
+
+fn make_custom_crypto_provider_with_ciphers(
+    allowed_cipher_names: &[String],
+) -> Result<Arc<rustls::crypto::CryptoProvider>> {
+    let default = rustls::crypto::aws_lc_rs::default_provider();
+    let allowed_suites: Vec<rustls::CipherSuite> = allowed_cipher_names
+        .iter()
+        .filter_map(|name| parse_cipher_suite_name(name))
+        .collect();
+
+    if allowed_suites.is_empty() {
+        return InvalidTlsConfigSnafu {
+            msg: format!("no valid cipher suite found in {:?}", allowed_cipher_names),
+        }
+        .fail();
+    }
+
+    let filtered: Vec<_> = default
+        .cipher_suites
+        .iter()
+        .filter(|cs| allowed_suites.contains(&cs.suite()))
+        .copied()
+        .collect();
+
+    if filtered.is_empty() {
+        return InvalidTlsConfigSnafu {
+            msg: format!(
+                "none of the requested cipher suites are available: {:?}",
+                allowed_cipher_names
+            ),
+        }
+        .fail();
+    }
+
+    let custom = rustls::crypto::CryptoProvider {
+        cipher_suites: filtered,
+        kx_groups: default.kx_groups.clone(),
+        signature_verification_algorithms: default.signature_verification_algorithms,
+        secure_random: default.secure_random,
+        key_provider: default.key_provider,
+    };
+
+    Ok(Arc::new(custom))
+}
+
+fn build_custom_client_tls_config(
+    path_config: &ClientTlsOption,
+    tls_verify: TlsVerify,
+) -> Result<rustls::ClientConfig> {
+    let provider: Arc<rustls::crypto::CryptoProvider> = if !path_config.cipher_suites.is_empty() {
+        make_custom_crypto_provider_with_ciphers(&path_config.cipher_suites)?
+    } else {
+        rustls::crypto::aws_lc_rs::default_provider().into()
+    };
+
+    let has_client_cert = !path_config.client_cert_path.is_empty();
+    let has_client_key = !path_config.client_key_path.is_empty();
+    if has_client_cert != has_client_key {
+        return InvalidTlsConfigSnafu {
+            msg: "client cert and key must be configured together".to_string(),
+        }
+        .fail();
+    }
+
+    let builder = match rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+    {
+        Ok(builder) => builder,
+        Err(err) => {
+            return InvalidTlsConfigSnafu {
+                msg: format!("invalid TLS protocol versions, {err}"),
+            }
+            .fail()
+        }
+    };
+
+    match tls_verify {
+        TlsVerify::VerifyNone => {
+            if has_client_cert {
+                let cert_chain = load_client_cert_chain(path_config.client_cert_path.as_str())?;
+                let private_key = load_client_private_key(path_config.client_key_path.as_str())?;
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .map_err(|err| {
+                        InvalidTlsConfigSnafu {
+                            msg: format!("invalid client certificate or key, {err}"),
+                        }
+                        .build()
+                    })
+            } else {
+                Ok(builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                    .with_no_client_auth())
+            }
+        }
+        TlsVerify::VerifyPeer => {
+            let mut root_store = rustls::RootCertStore::empty();
+            if !path_config.server_ca_cert_path.is_empty() {
+                let ca_cert_pem = std::fs::read_to_string(&path_config.server_ca_cert_path)
+                    .context(InvalidConfigFilePathSnafu)?;
+                let mut reader = BufReader::new(ca_cert_pem.as_bytes());
+                let certs = rustls_pemfile::certs(&mut reader)
+                    .collect::<std::result::Result<Vec<_>, std::io::Error>>()
+                    .map_err(|err| {
+                        InvalidTlsConfigSnafu {
+                            msg: format!(
+                                "invalid CA cert file `{}`, {err}",
+                                path_config.server_ca_cert_path
+                            ),
+                        }
+                        .build()
+                    })?;
+                for cert in certs {
+                    root_store.add(cert).map_err(|err| {
+                        InvalidTlsConfigSnafu {
+                            msg: format!("failed to add CA cert to root store, {err}"),
+                        }
+                        .build()
+                    })?;
+                }
+            } else {
+                // No explicit CA cert path: load system native root certificates
+                let native_certs = rustls_native_certs::load_native_certs();
+                for cert in native_certs.certs {
+                    let _ = root_store.add(cert);
+                }
+                if root_store.is_empty() {
+                    return InvalidTlsConfigSnafu {
+                        msg: "no CA certificates found: ca_cert not configured and no system root certificates available".to_string(),
+                    }
+                    .fail();
+                }
+            }
+            let config_builder = builder.with_root_certificates(root_store);
+            if has_client_cert {
+                let cert_chain = load_client_cert_chain(path_config.client_cert_path.as_str())?;
+                let private_key = load_client_private_key(path_config.client_key_path.as_str())?;
+                config_builder
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .map_err(|err| {
+                        InvalidTlsConfigSnafu {
+                            msg: format!("invalid client certificate or key, {err}"),
+                        }
+                        .build()
+                    })
+            } else {
+                Ok(config_builder.with_no_client_auth())
+            }
+        }
+    }
+}
+
+fn load_client_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let cert_file = std::fs::File::open(path).context(InvalidConfigFilePathSnafu)?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let cert_chain = match rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, std::io::Error>>()
+    {
+        Ok(certs) => certs,
+        Err(err) => {
+            return InvalidTlsConfigSnafu {
+                msg: format!("invalid client cert file `{path}`, {err}"),
+            }
+            .fail()
+        }
+    };
+    if cert_chain.is_empty() {
+        return InvalidTlsConfigSnafu {
+            msg: format!("no client certificate found in `{path}`"),
+        }
+        .fail();
+    }
+    Ok(cert_chain)
+}
+
+fn load_client_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    let key_file = std::fs::File::open(path).context(InvalidConfigFilePathSnafu)?;
+    let mut key_reader = BufReader::new(key_file);
+    match rustls_pemfile::private_key(&mut key_reader) {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => InvalidTlsConfigSnafu {
+            msg: format!("no private key found in `{path}`"),
+        }
+        .fail(),
+        Err(err) => InvalidTlsConfigSnafu {
+            msg: format!("invalid client key file `{path}`, {err}"),
+        }
+        .fail(),
+    }
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tower::service_fn;
@@ -558,6 +964,7 @@ mod tests {
                 http2_adaptive_window: None,
                 tcp_keepalive: None,
                 tcp_nodelay: true,
+                tls_verify: TlsVerify::VerifyPeer,
                 client_tls: None,
                 max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
                 max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
@@ -580,6 +987,7 @@ mod tests {
             .http2_adaptive_window(true)
             .tcp_keepalive(Duration::from_secs(2))
             .tcp_nodelay(false)
+            .tls_verify(TlsVerify::VerifyNone)
             .client_tls_config(ClientTlsOption {
                 server_ca_cert_path: "some_server_path".to_string(),
                 client_cert_path: "some_cert_path".to_string(),
@@ -600,6 +1008,7 @@ mod tests {
                 http2_adaptive_window: Some(true),
                 tcp_keepalive: Some(Duration::from_secs(2)),
                 tcp_nodelay: false,
+                tls_verify: TlsVerify::VerifyNone,
                 client_tls: Some(ClientTlsOption {
                     server_ca_cert_path: "some_server_path".to_string(),
                     client_cert_path: "some_cert_path".to_string(),
@@ -631,7 +1040,7 @@ mod tests {
             .tcp_nodelay(true);
         let mgr = ChannelManager::with_config(config);
 
-        let res = mgr.build_endpoint("test_addr");
+        let res = mgr.build_endpoint("test_addr", true, false);
 
         let _ = res.unwrap();
     }
@@ -712,5 +1121,62 @@ mod tests {
         drop(mgr);
 
         assert_eq!(1, Arc::strong_count(&pool_holder));
+    }
+
+    #[test]
+    fn test_with_tls_config_allows_empty_cert_paths() {
+        let config = ChannelConfig::new().client_tls_config(ClientTlsOption {
+            server_ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
+        });
+
+        let manager = ChannelManager::with_tls_config(config);
+        assert!(manager.is_ok());
+    }
+
+    #[test]
+    fn test_with_tls_config_verify_none_ignores_missing_ca_file() {
+        let config = ChannelConfig::new()
+            .tls_verify(TlsVerify::VerifyNone)
+            .client_tls_config(ClientTlsOption {
+                server_ca_cert_path: "/tmp/nonexistent-ca.pem".to_string(),
+                client_cert_path: String::new(),
+                client_key_path: String::new(),
+            });
+
+        let manager = ChannelManager::with_tls_config(config);
+        assert!(manager.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_uses_custom_connector_when_verify_none() {
+        let config = ChannelConfig::new()
+            .tls_verify(TlsVerify::VerifyNone)
+            .client_tls_config(ClientTlsOption {
+                server_ca_cert_path: String::new(),
+                client_cert_path: String::new(),
+                client_key_path: String::new(),
+            });
+
+        let mgr = ChannelManager::with_tls_config(config).unwrap();
+        let _ = mgr.get("test_addr").unwrap();
+
+        mgr.retain_channel(|_, channel| {
+            assert!(!channel.use_default_connector());
+            true
+        });
+    }
+
+    #[test]
+    fn test_with_tls_config_rejects_partial_client_cert_config() {
+        let config = ChannelConfig::new().client_tls_config(ClientTlsOption {
+            server_ca_cert_path: String::new(),
+            client_cert_path: "/tmp/client.crt".to_string(),
+            client_key_path: String::new(),
+        });
+
+        let manager = ChannelManager::with_tls_config(config);
+        assert!(manager.is_err());
     }
 }

@@ -15,7 +15,7 @@
 use std::pin::Pin;
 use std::str::FromStr;
 
-use arrow_flight::FlightData;
+use arrow_flight::{FlightData, Ticket};
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use futures::future;
@@ -24,21 +24,25 @@ use greptime_proto::v1::auth_header::AuthScheme;
 use greptime_proto::v1::greptime_database_client::GreptimeDatabaseClient;
 use greptime_proto::v1::greptime_request::Request;
 use greptime_proto::v1::{
-    greptime_response, AffectedRows, AuthHeader, Basic, DeleteRequests, GreptimeRequest,
-    RequestHeader, RowInsertRequests,
+    greptime_response, query_request, AffectedRows, AuthHeader, Basic, DeleteRequests,
+    GreptimeRequest, QueryRequest, RequestHeader, RowInsertRequests,
 };
+use prost::Message;
 use snafu::{OptionExt, ResultExt};
 use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap, MetadataValue};
 use tonic::transport::Channel;
 
 use crate::client::Client;
 use crate::error::{self, IllegalDatabaseResponseSnafu};
+use crate::flight::decoder::FlightDecoder;
 use crate::flight::do_put::DoPutResponse;
 use crate::Result;
 
 type FlightDataStream = Pin<Box<dyn Stream<Item = FlightData> + Send>>;
 
 type DoPutResponseStream = Pin<Box<dyn Stream<Item = Result<DoPutResponse>>>>;
+
+pub type QueryResultStream = Pin<Box<dyn Stream<Item = Result<arrow_array::RecordBatch>> + Send>>;
 
 /// The Client for GreptimeDB Database API.
 #[derive(Clone, Default)]
@@ -131,6 +135,13 @@ impl Database {
         self.handle(Request::Deletes(request), &[]).await
     }
 
+    /// Query with sql
+    pub async fn query(&self, sql: &str) -> Result<QueryResultStream> {
+        let query = query_request::Query::Sql(sql.to_string());
+        let request = QueryRequest { query: Some(query) };
+        self.handle_query(Request::Query(request)).await
+    }
+
     /// Ingest a stream of [RecordBatch]es that belong to a table, using Arrow Flight's "`DoPut`"
     /// method. The return value is also a stream, produces [DoPutResponse]s.
     pub async fn do_put(&self, stream: FlightDataStream) -> Result<DoPutResponseStream> {
@@ -160,6 +171,21 @@ impl Database {
             .and_then(|x| future::ready(DoPutResponse::try_from(x)))
             .boxed();
         Ok(response)
+    }
+
+    async fn handle_query(&self, request: Request) -> Result<QueryResultStream> {
+        let mut client = self.client.make_flight_client()?;
+        let request = self.to_rpc_request(request);
+
+        let ticket = Ticket {
+            ticket: request.encode_to_vec().into(),
+        };
+
+        let response = client.mut_inner().do_get(ticket).await?;
+
+        let stream = response.into_inner();
+        let flight_decoder = FlightDecoder::new(stream);
+        Ok(flight_decoder.map_err(error::Error::from).boxed())
     }
 
     async fn handle(&self, request: Request, hints: &[(&str, &str)]) -> Result<u32> {

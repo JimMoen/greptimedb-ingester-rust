@@ -185,6 +185,13 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Unexpected flight message: {err_msg}"))]
+    UnexpectedFlightMessage {
+        err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -204,6 +211,14 @@ impl From<Status> for Error {
         Self::Server {
             status: Box::new(e),
             msg,
+        }
+    }
+}
+impl From<arrow_flight::error::FlightError> for Error {
+    fn from(e: arrow_flight::error::FlightError) -> Self {
+        Self::UnexpectedFlightMessage {
+            err_msg: e.to_string(),
+            location: Location::default(),
         }
     }
 }
